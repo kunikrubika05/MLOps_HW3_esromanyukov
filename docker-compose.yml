@@ -1,0 +1,144 @@
+name: mlops-hw3
+x-app: &app
+  build: .
+  image: mlops-hw3-app
+  environment: &environment
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-password}
+  volumes:
+    - ./runtime:/runtime
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx256m
+    healthcheck:
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "10"]
+      interval: 5s
+      timeout: 15s
+      retries: 20
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 15s
+      retries: 20
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in transactions scores; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 1 --replication-factor 1
+        done
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fraud
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  initialize:
+    <<: *app
+    user: "0:0"
+    command: ["python", "-m", "pipeline.initialize"]
+    volumes:
+      - ./runtime:/runtime
+      - ./data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+  scorer:
+    <<: *app
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: on-failure
+  storage:
+    <<: *app
+    command: ["python", "-m", "fraud_detection.services.storage"]
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: on-failure
+  interface:
+    <<: *app
+    command: ["python", "-m", "streamlit", "run", "fraud_detection/services/interface.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.maxUploadSize=160", "--browser.gatherUsageStats=false"]
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+      kafka-setup:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8501:8501"
+  airflow:
+    build: ./airflow
+    image: mlops-hw3-airflow
+    environment:
+      <<: *environment
+      PYTHONPATH: /opt/airflow:/opt/airflow/project
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////runtime/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/dags
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /runtime/logs
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "2"
+    volumes:
+      - .:/opt/airflow/project:ro
+      - ./runtime:/runtime
+    depends_on:
+      initialize:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+  tools:
+    <<: *app
+    profiles: [tools]
+    volumes:
+      - ./data:/data:ro
+      - ./runtime:/runtime
+    command: ["python", "produce.py", "--help"]
+volumes:
+  postgres-data:

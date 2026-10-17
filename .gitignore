@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+.ruff_cache/
+data/*.csv
+!data/demo.csv
+runtime/
